@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+uv.lock.tmp
+.mypy_cache/
+.pytest_cache/
+
+# Demo input/output — not committed
+assets/tmp/*
+!assets/tmp/.gitkeep
+output/
