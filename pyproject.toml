@@ -3,6 +3,8 @@ name = "3dbag-qmesh"
 version = "0.1.0"
 description = "Generate quantized-mesh terrain tiles from raster elevation data for the 3D BAG"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = "==3.12.*"
 dependencies = [
     "gdal==3.11.4",

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qmesh - mesh vs. Cesium</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script>window.CESIUM_BASE_URL = "https://cdn.jsdelivr.net/npm/cesium@1.121.1/Build/Cesium/";</script>
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.121.1/Build/Cesium/Cesium.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cesium@1.121.1/Build/Cesium/Widgets/widgets.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root {
+    --k-blue: #00387D;
+    --k-teal: #00889E;
+    --k-ink-soft: #5A6675;
+    --k-paper: #0F141B;
+    --k-rule: #262C36;
+  }
+  html, body { margin: 0; height: 100%; background: var(--k-paper); overflow: hidden; }
+  body { display: flex; flex-direction: column; font-family: "Helvetica Neue", Arial, sans-serif; }
+
+  header {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 18px;
+    background: #14181F;
+    border-bottom: 1px solid var(--k-rule);
+    color: #D7DEE6;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+  header h1 span { color: var(--k-teal); }
+  #status {
+    font-size: 12px;
+    color: var(--k-ink-soft);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  #panels {
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    min-height: 0;
+  }
+  .panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .panel { border-right: 1px solid var(--k-rule); border-bottom: 1px solid var(--k-rule); }
+  #panels .panel:nth-child(2n) { border-right: none; }
+  #panels .panel:nth-child(n+3) { border-bottom: none; }
+  .panel-label {
+    flex: 0 0 auto;
+    padding: 6px 14px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #9AA5B4;
+    background: #1B212B;
+  }
+  .panel-label b { color: #D7DEE6; }
+  .panel-body { flex: 1 1 auto; min-height: 0; position: relative; background: #000; }
+
+  #locatorMap { width: 100%; height: 100%; background: #1B212B; }
+  #heightmapBody { display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  #heightmapImg { max-width: 100%; max-height: 100%; display: block; }
+
+  .cesium-widget-credits, .cesium-viewer-bottom { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>3D BAG &middot; <span>qmesh</span> demo - Sint Pietersberg, Maastricht</h1>
+  <span id="status">loading terrain&hellip;</span>
+</header>
+
+<div id="panels">
+  <div class="panel">
+    <div class="panel-label"><b>Locator</b> - OpenStreetMap</div>
+    <div id="locatorMap" class="panel-body"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-label"><b>Heightmap</b> - input DEM used for this tile (44&ndash;98m NAP)</div>
+    <div id="heightmapBody" class="panel-body">
+      <img id="heightmapImg" src="viewer/heightmap.png" alt="Shaded-relief heightmap of the AHN DTM tile used for this demo">
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-label" id="meshLabel"><b>Mesh</b> - raw generated terrain, no imagery</div>
+    <div id="meshContainer" class="panel-body"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-label"><b>Cesium</b> - same tiles, shaded + PDOK luchtfoto</div>
+    <div id="cesiumContainer" class="panel-body"></div>
+  </div>
+</div>
+
+<script>
+// Center of the AHN tile used for this demo (Fort Sint Pieter / ENCI quarry, Maastricht).
+const DEMO_LON = 5.68529;
+const DEMO_LAT = 50.83572;
+
+// --- Locator map (2D, OpenStreetMap via Leaflet) --------------------------
+const locator = L.map("locatorMap", { zoomControl: false, attributionControl: false })
+  .setView([DEMO_LAT, DEMO_LON], 14);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(locator);
+L.marker([DEMO_LAT, DEMO_LON]).addTo(locator);
+L.rectangle(
+  [[50.83258, 5.68243], [50.84153, 5.69668]],
+  { color: "#00889E", weight: 2, fillOpacity: 0.08 }
+).addTo(locator);
+
+// --- Cesium (mesh + textured) ----------------------------------------------
+(async function () {
+  const statusEl = document.getElementById("status");
+  // No Cesium ion assets are used (local terrain only, OSM imagery), so no token is needed.
+  Cesium.Ion.defaultAccessToken = undefined;
+
+  const commonOptions = {
+    baseLayerPicker: false,
+    geocoder: false,
+    homeButton: false,
+    sceneModePicker: false,
+    navigationHelpButton: false,
+    animation: false,
+    timeline: false,
+    fullscreenButton: false,
+    infoBox: false,
+    selectionIndicator: false,
+    baseLayer: false,
+    shouldAnimate: true,
+  };
+
+  let terrainProvider;
+  try {
+    // Same layer.json qmesh just wrote, served by qmesh's own http.server on :8000.
+    terrainProvider = await Cesium.CesiumTerrainProvider.fromUrl("./output/tiles", {
+      requestVertexNormals: true,
+    });
+    statusEl.textContent = "terrain loaded";
+  } catch (err) {
+    statusEl.textContent = "failed to load ./output/tiles - run `uv run qmesh` first";
+    console.error(err);
+    return;
+  }
+
+  const viewerMesh = new Cesium.Viewer("meshContainer", {
+    ...commonOptions,
+    terrainProvider,
+  });
+  // PDOK "Luchtfoto Actueel" (current aerial orthophoto), WMTS, EPSG:3857.
+  // TileMatrix IDs in this matrix set are zero-padded ("00".."21"), not
+  // plain zoom numbers, hence the explicit tileMatrixLabels.
+  const luchtfoto = new Cesium.WebMapTileServiceImageryProvider({
+    url: "https://service.pdok.nl/hwh/luchtfotorgb/wmts/v1_0/Actueel_orthoHR/{TileMatrixSet}/{TileMatrix}/{TileCol}/{TileRow}.jpeg",
+    layer: "Actueel_orthoHR",
+    style: "default",
+    format: "image/jpeg",
+    tileMatrixSetID: "EPSG:3857",
+    tileMatrixLabels: Array.from({ length: 22 }, (_, i) => String(i).padStart(2, "0")),
+    maximumLevel: 21,
+    credit: new Cesium.Credit("Luchtfoto: PDOK / Beeldmateriaal Nederland"),
+  });
+
+  const viewerCesium = new Cesium.Viewer("cesiumContainer", {
+    ...commonOptions,
+    terrainProvider,
+    baseLayer: new Cesium.ImageryLayer(luchtfoto),
+  });
+
+  // Left panel: strip it down to bare relief so the mesh itself reads clearly -
+  // flat white material + lighting, no imagery. If the build exposes the
+  // (undocumented) wireframe debug flag, prefer that instead.
+  viewerMesh.scene.globe.baseColor = Cesium.Color.WHITE;
+  viewerMesh.scene.globe.enableLighting = true;
+  let wireframe = false;
+  try {
+    viewerMesh.scene.globe._surface.tileProvider._debug.wireframe = true;
+    wireframe = viewerMesh.scene.globe._surface.tileProvider._debug.wireframe === true;
+  } catch (err) {
+    console.warn("Wireframe debug flag unavailable in this Cesium build; falling back to shaded relief.", err);
+  }
+  if (wireframe) {
+    document.getElementById("meshLabel").innerHTML = "<b>Mesh</b> - wireframe, no imagery";
+  }
+
+  // No enableLighting here: the aerial photo already has real sun/shadow
+  // baked in from when it was shot. Layering synthetic sun-angle shading
+  // from the terrain normals on top of that multiplies the two together
+  // and the whole scene reads as a dark overlay -- fine for the bare-relief
+  // Mesh panel above, wrong for photographic imagery.
+
+  // Fly both cameras to the demo area with the same oblique view.
+  const target = {
+    destination: Cesium.Cartesian3.fromDegrees(DEMO_LON, DEMO_LAT, 700),
+    orientation: { heading: 0.0, pitch: Cesium.Math.toRadians(-35), roll: 0.0 },
+  };
+  viewerMesh.camera.setView(target);
+  viewerCesium.camera.setView(target);
+
+  // Keep the mesh view locked to whatever the (interactive, textured) Cesium
+  // view is looking at - pan/zoom/tilt the right panel, the left one follows.
+  viewerCesium.scene.postRender.addEventListener(() => {
+    viewerMesh.camera.setView({
+      destination: viewerCesium.camera.positionWC,
+      orientation: {
+        heading: viewerCesium.camera.heading,
+        pitch: viewerCesium.camera.pitch,
+        roll: viewerCesium.camera.roll,
+      },
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

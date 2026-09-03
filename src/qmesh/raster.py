@@ -3,12 +3,17 @@
 import logging
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import rasterio
 
 from qmesh.boundingbox import BoundingBox
 from qmesh.idw import image_interpolation_idw
+
+# A raster source can be a local Path or a GDAL virtual-filesystem string
+# (e.g. "/vsicurl/https://..."); keep the latter as plain str — round-tripping
+# it through Path() would collapse "https://" to "https:/".
+RasterSource = Union[Path, str]
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +45,7 @@ def image_get_boundingbox(image: Path) -> BoundingBox:
 
 
 def reproject_image(
-    source_image: Path,
+    source_image: RasterSource,
     source_projection: str,
     destination_image: Path,
     destination_projection: str,
@@ -52,7 +57,8 @@ def reproject_image(
     builds overviews so downstream sampling remains responsive.
     """
 
-    destination_image.parent.mkdir(parents=True, exist_ok=True)
+    if not str(destination_image).startswith("/vsimem/"):
+        destination_image.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"  Reprojecting {source_image} -> {destination_image}...")
 
@@ -133,7 +139,8 @@ def build_vrt(
         logger.info("  No rasters provided; skipping VRT creation.")
         return None
 
-    vrt_path.parent.mkdir(parents=True, exist_ok=True)
+    if not str(vrt_path).startswith("/vsimem/"):
+        vrt_path.parent.mkdir(parents=True, exist_ok=True)
     filelist_path = filelist_path or vrt_path.with_suffix(".txt")
 
     with filelist_path.open("w") as f:

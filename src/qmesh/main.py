@@ -2,6 +2,7 @@
 Docstring for qmesh.main
 """
 
+import argparse
 import http.server
 import logging
 import os
@@ -11,132 +12,248 @@ from pathlib import Path
 from osgeo import gdal
 
 from qmesh.cesium import render_layerjson
+from qmesh.memory_raster import reproject_sources_to_memory
 from qmesh.mesh import (
     apply_vertex_averaging,
     encode_terrain_tiles,
-    generate_intermediate_tiles,
+    generate_and_save_intermediate_tiles,
     generate_terrain_dummy,
+    generate_terrain_tiles_from_array,
+    generate_terrain_tiles_streaming,
 )
 from qmesh.pyramid import calculate_pyramid
 from qmesh.raster import build_vrt, image_get_boundingbox, reproject_image
+from qmesh.source import basename, resolve_source_images
 
 logger = logging.getLogger(__name__)
-PORT = 8000
+DEFAULT_PORT = 8000
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="qmesh",
+        description="Generate quantized-mesh terrain tiles from raster elevation data.",
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        dest="inputs",
+        action="append",
+        metavar="PATH_OR_URL",
+        help=(
+            "Local directory, local raster file, direct URL/s3:// /az:// / "
+            "/vsi* reference to a single raster (streamed by GDAL), or an "
+            "http(s) API endpoint such as a WCS GetCoverage request "
+            "(downloaded first). Repeatable. Defaults to assets/tmp/."
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("output"),
+        help="Output directory (default: output)",
+    )
+    parser.add_argument(
+        "--download-dir",
+        type=Path,
+        default=None,
+        help="Where remote --input URLs are downloaded to (default: assets/tmp/)",
+    )
+    parser.add_argument(
+        "--source-srs",
+        default="EPSG:7415",
+        help="CRS to assume for input rasters (default: EPSG:7415)",
+    )
+    parser.add_argument(
+        "--target-srs",
+        default="EPSG:4979",
+        help="CRS to reproject rasters into (default: EPSG:4979)",
+    )
+    parser.add_argument(
+        "--max-zoom",
+        type=int,
+        default=15,
+        help="Maximum zoom level to generate real terrain tiles for (default: 15)",
+    )
+    parser.add_argument(
+        "--dummy-max-zoom",
+        type=int,
+        default=6,
+        help="Highest zoom level covered by dummy/placeholder tiles (default: 6)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"Port for the local tile server (default: {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--no-serve",
+        action="store_true",
+        help="Generate tiles and exit, without starting the local HTTP server",
+    )
+    parser.add_argument(
+        "--legacy-batch",
+        action="store_true",
+        help=(
+            "Use the older three-barrier pipeline (triangulate all tiles, "
+            "then stitch all tiles, then encode all tiles) instead of the "
+            "default streaming one-tile-at-a-time pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--in-memory",
+        action="store_true",
+        help=(
+            "Reproject/mosaic straight into a single in-memory array (no "
+            "intermediate files at all -- not even a VRT) and compute the "
+            "pyramid from that array's own bounds as a post step, instead "
+            "of from a file on disk. Implies the streaming pipeline; not "
+            "compatible with --legacy-batch."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
     """Main function to generate quantized mesh tiles from a raster dataset."""
     gdal.UseExceptions()
+    args = parse_args(argv)
 
-    # Find all source images in assets/tmp
-    source_dir = Path("assets/tmp")
-    source_images = sorted(
-        [
-            f
-            for f in source_dir.iterdir()
-            if f.is_file() and f.suffix.lower() in [".tif", ".tiff"]
-        ]
-    )
+    if args.legacy_batch and args.in_memory:
+        raise ValueError("--legacy-batch and --in-memory can't be used together")
+
+    download_dir = args.download_dir or Path("assets/tmp")
+    source_images = resolve_source_images(args.inputs or ["assets/tmp"], download_dir)
 
     if not source_images:
-        raise ValueError(f"No TIFF files found in {source_dir}")
+        raise ValueError("No source rasters found (checked --input / assets/tmp)")
 
     logger.info(f"Found {len(source_images)} source images to reproject")
 
-    # Reproject all images to WGS84
-    output_dir = Path("output/intermediate")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    reprojected_images = []
-    for source_image in source_images:
-        destination_image = output_dir / f"reprojected_{source_image.name}"
-        result = reproject_image(
-            source_image, "EPSG:7415", destination_image, "EPSG:4979"
+    in_memory_raster = None
+    if args.in_memory:
+        # Everything up to here (and this reproject/mosaic step) has stayed
+        # in memory -- no intermediate files, not even a VRT. dataset_bbox
+        # below comes straight out of the array's own transform: the
+        # pyramid is computed *after* the data exists, from the data
+        # itself, not from a file this step had to write first.
+        in_memory_raster = reproject_sources_to_memory(
+            source_images, args.source_srs, args.target_srs
         )
-        if result:
-            reprojected_images.append(result)
+        dataset_bbox = in_memory_raster.bounds
+    else:
+        # Reproject all images to the target CRS
+        intermediate_dir = args.output / "intermediate"
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-    if not reprojected_images:
-        raise ValueError("Failed to reproject any images")
+        reprojected_images = []
+        for source_image in source_images:
+            destination_image = intermediate_dir / f"reprojected_{basename(source_image)}"
+            result = reproject_image(
+                source_image, args.source_srs, destination_image, args.target_srs
+            )
+            if result:
+                reprojected_images.append(result)
 
-    logger.info(f"Successfully reprojected {len(reprojected_images)} images")
+        if not reprojected_images:
+            raise ValueError("Failed to reproject any images")
 
-    # Build VRT mosaic from reprojected images
-    vrt_path = output_dir / "mosaic.vrt"
-    image_transformed = build_vrt(reprojected_images, vrt_path)
+        logger.info(f"Successfully reprojected {len(reprojected_images)} images")
 
-    if not image_transformed:
-        raise ValueError("Failed to create VRT mosaic")
+        # Build VRT mosaic from reprojected images
+        vrt_path = intermediate_dir / "mosaic.vrt"
+        image_transformed = build_vrt(reprojected_images, vrt_path)
 
-    logger.info(f"Created VRT mosaic: {image_transformed}")
+        if not image_transformed:
+            raise ValueError("Failed to create VRT mosaic")
 
-    dataset_bbox = image_get_boundingbox(image_transformed)
+        logger.info(f"Created VRT mosaic: {image_transformed}")
+        dataset_bbox = image_get_boundingbox(image_transformed)
+
     logger.info(
-        "Dataset bounds:",
-        dataset_bbox.minx,
-        dataset_bbox.miny,
-        dataset_bbox.maxx,
-        dataset_bbox.maxy,
+        f"Dataset bounds: {dataset_bbox.minx} {dataset_bbox.miny} "
+        f"{dataset_bbox.maxx} {dataset_bbox.maxy}"
     )
 
-    layerjson_str = render_layerjson(dataset_bbox, 15)
+    layerjson_str = render_layerjson(dataset_bbox, args.max_zoom)
 
-    tiles_output_dir = Path("output/tiles")
+    tiles_output_dir = args.output / "tiles"
     tiles_output_dir.mkdir(parents=True, exist_ok=True)
     layerjson_path = tiles_output_dir / "layer.json"
     layerjson_path.write_text(layerjson_str)
     logger.info(f"Wrote layer.json to {layerjson_path}")
 
-    # Generate dummy tiles for lower zoom levels (0-6)
-    dummy_tiles = calculate_pyramid(dataset_bbox, 0, 6)
-    logger.info(f"Generating {len(dummy_tiles)} dummy tiles (zoom 0-6)...")
+    # Generate dummy tiles for the low zoom levels
+    dummy_tiles = calculate_pyramid(dataset_bbox, 0, args.dummy_max_zoom)
+    logger.info(
+        f"Generating {len(dummy_tiles)} dummy tiles (zoom 0-{args.dummy_max_zoom})..."
+    )
     generate_terrain_dummy(dummy_tiles, tiles_output_dir)
 
-    # Generate real tiles for higher zoom levels (7-15)
-    real_tiles = calculate_pyramid(dataset_bbox, 6, 15)
-    logger.info(f"Generating {len(real_tiles)} real tiles (zoom 7-15)...")
+    # Generate real tiles for the high zoom levels
+    real_tiles = calculate_pyramid(dataset_bbox, args.dummy_max_zoom, args.max_zoom)
+    logger.info(
+        f"Generating {len(real_tiles)} real tiles "
+        f"(zoom {args.dummy_max_zoom}-{args.max_zoom})..."
+    )
 
     # Configuration
     max_workers = os.cpu_count()  # Use all available CPU cores
-    keep_intermediate = False  # Clean up intermediate files after completion
-    intermediate_dir = Path("output/intermediate_tiles")
-
     logger.info(f"  Workers: {max_workers}")
-    logger.info(f"  Intermediate directory: {intermediate_dir}")
 
-    # Phase 1: Generate intermediate tiles (TINs)
-    logger.info(f"\n{'=' * 70}")
-    generate_intermediate_tiles(
-        image_transformed,
-        real_tiles,
-        intermediate_dir,
-        max_workers=max_workers,
-    )
+    if args.legacy_batch:
+        # Three full barriers: triangulate everything, stitch everything,
+        # encode everything -- kept around as a known-good fallback.
+        intermediate_tiles_dir = args.output / "intermediate_tiles"
+        logger.info(f"  Intermediate directory: {intermediate_tiles_dir}")
 
-    # Phase 2: Apply vertex averaging
-    logger.info(f"\n{'=' * 70}")
-    apply_vertex_averaging(
-        intermediate_dir,
-        max_workers=max_workers,
-    )
+        logger.info(f"\n{'=' * 70}")
+        saved = generate_and_save_intermediate_tiles(
+            image_transformed, real_tiles, intermediate_tiles_dir, max_workers=max_workers
+        )
+        logger.info(f"Phase 1 complete: {saved} tiles saved to {intermediate_tiles_dir}")
 
-    # Phase 3: Encode terrain tiles
-    logger.info(f"\n{'=' * 70}")
-    encode_terrain_tiles(
-        intermediate_dir,
-        tiles_output_dir,
-        max_workers=max_workers,
-        cleanup=not keep_intermediate,
-    )
+        logger.info(f"\n{'=' * 70}")
+        apply_vertex_averaging(intermediate_tiles_dir, max_workers=max_workers)
+
+        logger.info(f"\n{'=' * 70}")
+        encode_terrain_tiles(
+            intermediate_tiles_dir, tiles_output_dir, max_workers=max_workers, cleanup=True
+        )
+    elif in_memory_raster is not None:
+        # Same pipeline as the streaming default, but triangulation reads
+        # its windows out of shared memory instead of opening a file.
+        logger.info(f"\n{'=' * 70}")
+        generate_terrain_tiles_from_array(
+            in_memory_raster,
+            real_tiles,
+            tiles_output_dir,
+            max_workers=max_workers,
+        )
+    else:
+        # Default: triangulate -> stitch -> encode as one pipeline, tile by
+        # tile, connected by producer/consumer queues (see mesh.py for why).
+        logger.info(f"\n{'=' * 70}")
+        generate_terrain_tiles_streaming(
+            image_transformed,
+            real_tiles,
+            tiles_output_dir,
+            max_workers=max_workers,
+        )
 
     logger.info(f"\n{'=' * 70}")
     logger.info("Tile generation complete!")
     logger.info(f"Tiles available at: {tiles_output_dir}")
-    logger.info("\nStarting local server...")
 
+    if args.no_serve:
+        return
+
+    logger.info("\nStarting local server...")
     Handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        logger.info(f"Serving at http://localhost:{PORT}")
+    with socketserver.TCPServer(("", args.port), Handler) as httpd:
+        logger.info(f"Serving at http://localhost:{args.port}")
         httpd.serve_forever()
 
 
