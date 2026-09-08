@@ -91,8 +91,5 @@ including `--on-disk` above.
 
 MIT — see [LICENSE](LICENSE).
 
-## Status
-
-Freshly split out of `3dbag-runner`; not yet reviewed for CI or packaging
-polish. See [3DBAG/3dbag-runner](https://github.com/3DBAG/3dbag-runner) and
-the [3DBAG organisation](https://github.com/3DBAG) for the wider pipeline.
+## AI disclosure
+AI was used in making qmesh.
