@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -33,216 +33,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class IntermediateTileMetadata:
-    """Lightweight metadata for tracking intermediate tiles."""
-
-    zoom: int
-    tile_x: int
-    tile_y: int
-    file_path: Path
-    minx: float
-    miny: float
-    maxx: float
-    maxy: float
-
-    @property
-    def tile_key(self) -> tuple[int, int, int]:
-        """Return unique key for this tile."""
-        return (self.zoom, self.tile_x, self.tile_y)
-
-    @property
-    def boundingbox(self) -> BoundingBox:
-        """Return BoundingBox for this tile."""
-        return BoundingBox(self.minx, self.miny, self.maxx, self.maxy)
-
-
-# ============================================================================
-# Intermediate Tile Disk I/O Functions
-# ============================================================================
-
-
-def _get_intermediate_tile_path(
-    intermediate_dir: Path, zoom: int, tile_x: int, tile_y: int
-) -> Path:
-    """Get the file path for an intermediate tile."""
-    return intermediate_dir / str(zoom) / str(tile_x) / f"{tile_y}.npz"
-
-
-def _save_intermediate_tile(
-    tile: Tile,
-    vertices: NDArray[Any],
-    triangles: NDArray[Any],
-    tile_size: int,
-    intermediate_dir: Path,
-) -> IntermediateTileMetadata:
-    """Save TIN to disk as compressed .npz file.
-
-    Args:
-        tile: Tile descriptor
-        vertices: Vertex array in pixel space
-        triangles: Triangle indices
-        tile_size: Size of the heightmap used
-        intermediate_dir: Directory to store intermediate files
-
-    Returns:
-        Metadata for the saved tile
-    """
-    file_path = _get_intermediate_tile_path(
-        intermediate_dir, tile.zoom, tile.tile_x, tile.tile_y
-    )
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Save with compression
-    np.savez_compressed(
-        file_path,
-        vertices=vertices,
-        triangles=triangles,
-        minx=tile.boundingbox.minx,
-        miny=tile.boundingbox.miny,
-        maxx=tile.boundingbox.maxx,
-        maxy=tile.boundingbox.maxy,
-        tile_size=tile_size,
-    )
-
-    return IntermediateTileMetadata(
-        zoom=tile.zoom,
-        tile_x=tile.tile_x,
-        tile_y=tile.tile_y,
-        file_path=file_path,
-        minx=tile.boundingbox.minx,
-        miny=tile.boundingbox.miny,
-        maxx=tile.boundingbox.maxx,
-        maxy=tile.boundingbox.maxy,
-    )
-
-
-def _load_intermediate_tile(
-    metadata: IntermediateTileMetadata,
-) -> tuple[NDArray[Any], NDArray[Any], int]:
-    """Load TIN from disk.
-
-    Args:
-        metadata: Metadata for the tile to load
-
-    Returns:
-        Tuple of (vertices, triangles, tile_size)
-    """
-    data = np.load(metadata.file_path)
-    vertices = data["vertices"]
-    triangles = data["triangles"]
-    tile_size = int(data["tile_size"])
-    return vertices, triangles, tile_size
-
-
-def _update_intermediate_tile_vertices(
-    metadata: IntermediateTileMetadata,
-    vertices: NDArray[Any],
-) -> None:
-    """Update only vertices in .npz file (read-modify-write).
-
-    Args:
-        metadata: Metadata for the tile to update
-        vertices: New vertex array to save
-    """
-    # Load existing data
-    data = np.load(metadata.file_path)
-    triangles = data["triangles"]
-    tile_size = data["tile_size"]
-    minx = data["minx"]
-    miny = data["miny"]
-    maxx = data["maxx"]
-    maxy = data["maxy"]
-
-    # Save with updated vertices
-    np.savez_compressed(
-        metadata.file_path,
-        vertices=vertices,
-        triangles=triangles,
-        minx=minx,
-        miny=miny,
-        maxx=maxx,
-        maxy=maxy,
-        tile_size=tile_size,
-    )
-
-
-def _load_metadata_from_intermediate_dir(
-    intermediate_dir: Path,
-) -> dict[tuple[int, int, int], IntermediateTileMetadata]:
-    """Scan intermediate directory and build metadata index.
-
-    Args:
-        intermediate_dir: Directory containing intermediate .npz files
-
-    Returns:
-        Dictionary mapping (zoom, tile_x, tile_y) to metadata
-    """
-    metadata_index = {}
-
-    # Find all .npz files
-    for npz_file in intermediate_dir.rglob("*.npz"):
-        try:
-            # Parse path: intermediate_dir/zoom/tile_x/tile_y.npz
-            tile_y = int(npz_file.stem)
-            tile_x = int(npz_file.parent.name)
-            zoom = int(npz_file.parent.parent.name)
-
-            # Load bounds from file
-            data = np.load(npz_file)
-            minx = float(data["minx"])
-            miny = float(data["miny"])
-            maxx = float(data["maxx"])
-            maxy = float(data["maxy"])
-
-            metadata = IntermediateTileMetadata(
-                zoom=zoom,
-                tile_x=tile_x,
-                tile_y=tile_y,
-                file_path=npz_file,
-                minx=minx,
-                miny=miny,
-                maxx=maxx,
-                maxy=maxy,
-            )
-            metadata_index[metadata.tile_key] = metadata
-        except (ValueError, KeyError) as e:
-            logger.warning(f" Skipping invalid intermediate file {npz_file}: {e}")
-            continue
-
-    return metadata_index
-
-
 # ============================================================================
 # Edge Averaging Functions
 # ============================================================================
-
-
-def _average_edge_vertices(
-    metadata1: IntermediateTileMetadata,
-    metadata2: IntermediateTileMetadata,
-    position_tolerance: float = 1e-9,
-) -> tuple[NDArray[Any], NDArray[Any]]:
-    """Average vertices along shared edge between two tiles (disk-backed).
-
-    Loads both tiles from their .npz files, then delegates the actual
-    matching/averaging to :func:`_average_edge_vertices_arrays`. Kept for the
-    batch Phase 2 path (``apply_vertex_averaging``); the streaming pipeline
-    calls the array version directly, in-memory, no disk round-trip.
-
-    Args:
-        metadata1: Metadata for first tile
-        metadata2: Metadata for second tile
-        position_tolerance: Tolerance for matching vertex positions in pixel space
-
-    Returns:
-        Tuple of (updated_vertices1, updated_vertices2)
-    """
-    vertices1, _, _ = _load_intermediate_tile(metadata1)
-    vertices2, _, _ = _load_intermediate_tile(metadata2)
-    return _average_edge_vertices_arrays(
-        metadata1, vertices1, metadata2, vertices2, position_tolerance
-    )
 
 
 def _average_edge_vertices_arrays(
@@ -370,71 +163,14 @@ def _average_edge_vertices_arrays(
     return vertices1, vertices2
 
 
-def _find_edges_by_type(
-    tile_index: dict[tuple[int, int, int], IntermediateTileMetadata],
-    zoom: int,
-    edge_type: str,
-) -> list[tuple[IntermediateTileMetadata, IntermediateTileMetadata]]:
-    """Find all edges of a specific type at a zoom level.
-
-    Args:
-        tile_index: Dictionary mapping (zoom, tile_x, tile_y) to metadata
-        zoom: Zoom level to process
-        edge_type: One of 'horizontal_even', 'horizontal_odd',
-                   'vertical_even', 'vertical_odd'
-
-    Returns:
-        List of tile pairs that share an edge
-    """
-    edges = []
-
-    # Filter tiles at this zoom level
-    tiles_at_zoom = [meta for meta in tile_index.values() if meta.zoom == zoom]
-
-    for tile1 in tiles_at_zoom:
-        if edge_type == "horizontal_even":
-            # Process horizontal edges where tile_y is even
-            if tile1.tile_y % 2 == 0:
-                # Look for tile below (tile_y + 1)
-                key2 = (zoom, tile1.tile_x, tile1.tile_y + 1)
-                if key2 in tile_index:
-                    edges.append((tile1, tile_index[key2]))
-
-        elif edge_type == "horizontal_odd":
-            # Process horizontal edges where tile_y is odd
-            if tile1.tile_y % 2 == 1:
-                # Look for tile below (tile_y + 1)
-                key2 = (zoom, tile1.tile_x, tile1.tile_y + 1)
-                if key2 in tile_index:
-                    edges.append((tile1, tile_index[key2]))
-
-        elif edge_type == "vertical_even":
-            # Process vertical edges where tile_x is even
-            if tile1.tile_x % 2 == 0:
-                # Look for tile to the right (tile_x + 1)
-                key2 = (zoom, tile1.tile_x + 1, tile1.tile_y)
-                if key2 in tile_index:
-                    edges.append((tile1, tile_index[key2]))
-
-        elif edge_type == "vertical_odd":
-            # Process vertical edges where tile_x is odd
-            if tile1.tile_x % 2 == 1:
-                # Look for tile to the right (tile_x + 1)
-                key2 = (zoom, tile1.tile_x + 1, tile1.tile_y)
-                if key2 in tile_index:
-                    edges.append((tile1, tile_index[key2]))
-
-    return edges
-
-
 # ============================================================================
 # Streaming rendezvous stitcher
 #
-# The batch Phase 2 above needs every tile in a zoom level on disk before it
-# can start, then makes four full passes over them (horizontal/vertical x
-# even/odd) purely to keep concurrent writers from touching the same tile at
-# once. Both constraints disappear if edge-matching runs as tiles arrive
-# instead of after they all have:
+# Stitching tile boundaries the obvious way means writing every tile in a
+# zoom level to disk first, then making four full passes over them
+# (horizontal/vertical x even/odd) purely to keep concurrent writers from
+# touching the same tile at once. Both constraints disappear if edge-matching
+# runs as tiles arrive instead of after they all have:
 #
 #   - A tile has at most 4 same-zoom neighbours (N/E/S/W). The moment BOTH
 #     tiles on either side of an edge are in hand, that edge can be averaged
@@ -518,7 +254,7 @@ class RendezvousStitcher:
     Not thread-safe by design -- it's meant to be driven by a single
     coordinator (thread or loop); that's what lets it skip locking
     altogether while still being safe against the classic "two tiles share
-    a corner" race the batch version handles with even/odd passes.
+    a corner" race that even/odd passes exist to avoid.
     """
 
     def __init__(self, tiles: list[Tile]):
@@ -722,47 +458,8 @@ def generate_terrain_dummy(tiles: list[Tile], output_dir: Path) -> None:
 
 
 # ============================================================================
-# Three-Phase Pipeline Functions
+# Streaming pipeline: triangulate -> stitch -> encode
 # ============================================================================
-
-
-def _generate_single_tin(
-    dataset_path: Path,
-    tile: Tile,
-    tile_size: int,
-    intermediate_dir: Path,
-) -> IntermediateTileMetadata:
-    """Generate TIN for a single tile and save to disk.
-
-    This function is used by generate_intermediate_tiles for parallel processing.
-    """
-    # Generate new TIN
-    with rasterio.open(dataset_path) as dataset:
-        window = from_bounds(
-            tile.boundingbox.minx,
-            tile.boundingbox.miny,
-            tile.boundingbox.maxx,
-            tile.boundingbox.maxy,
-            dataset.transform,
-        )
-
-        heightmap = dataset.read(
-            1,
-            window=window,
-            out_shape=(tile_size, tile_size),
-            resampling=Resampling.lanczos,
-            fill_value=0.0,
-        ).astype(np.float32)
-
-        # Triangulate with pydelatin
-        tin = Delatin(heightmap, max_error=0.001, level=False, border_height=0)
-
-        # Save to disk
-        metadata = _save_intermediate_tile(
-            tile, tin.vertices, tin.triangles, tile_size, intermediate_dir
-        )
-
-        return metadata
 
 
 def _generate_single_tin_streaming(
@@ -772,7 +469,7 @@ def _generate_single_tin_streaming(
 ) -> tuple[Tile, NDArray[Any], NDArray[Any]]:
     """Generate TIN for a single tile and return vertices/triangles (streaming).
 
-    This function is used by generate_intermediate_tiles for streaming parallel processing.
+    Runs in the triangulation process pool of generate_terrain_tiles_streaming.
     Returns the tile and its TIN data without saving to disk.
     """
     with rasterio.open(dataset_path) as dataset:
@@ -796,92 +493,6 @@ def _generate_single_tin_streaming(
         tin = Delatin(heightmap, max_error=0.001, level=False, border_height=0)
 
         return tile, tin.vertices, tin.triangles
-
-
-def generate_intermediate_tiles(
-    dataset_path: Path,
-    tiles: list[Tile],
-    intermediate_dir: Path,
-    tile_size: int = 65,
-    max_workers: int | None = None,
-) -> Any:
-    """Phase 1: Generate TINs and yield them as they're completed (streaming).
-
-    Triangulates each tile using pydelatin and yields the results immediately
-    without writing to disk. This phase is fully parallelizable.
-
-    Args:
-        dataset_path: Path to the heightmap raster dataset
-        tiles: List of tiles to generate
-        intermediate_dir: Directory to store intermediate .npz files (unused in streaming mode)
-        tile_size: Size of the heightmap to read (default 65)
-        max_workers: Maximum number of parallel workers (default: CPU count)
-
-    Yields:
-        tuple[Tile, NDArray, NDArray]: (tile, vertices, triangles) for each processed tile
-    """
-    logger.info(f"Phase 1: Generating {len(tiles)} intermediate tiles (streaming)...")
-
-    completed = 0
-    total = len(tiles)
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _generate_single_tin_streaming,
-                dataset_path,
-                tile,
-                tile_size,
-            ): tile
-            for tile in tiles
-        }
-
-        for future in as_completed(futures):
-            try:
-                tile, vertices, triangles = future.result()
-                completed += 1
-
-                if completed % 100 == 0 or completed == total:
-                    logger.info(f"  Progress: {completed}/{total} tiles completed")
-
-                yield tile, vertices, triangles
-
-            except Exception as e:
-                tile = futures[future]
-                logger.error(f"  Error processing tile {tile}: {e}")
-
-    logger.info(f"Phase 1 complete: {completed} tiles generated")
-
-
-def generate_and_save_intermediate_tiles(
-    dataset_path: Path,
-    tiles: list[Tile],
-    intermediate_dir: Path,
-    tile_size: int = 65,
-    max_workers: int | None = None,
-) -> int:
-    """Phase 1 (disk-backed): drive the ``generate_intermediate_tiles`` stream
-    and persist each yielded TIN to ``intermediate_dir`` as it completes.
-
-    ``generate_intermediate_tiles`` is a generator — calling it alone builds
-    the generator object but runs none of its body, so nothing is ever
-    produced or saved unless something actually iterates it. This is that
-    "something", for the local, disk-backed pipeline that Phase 2/3
-    (``apply_vertex_averaging`` / ``encode_terrain_tiles``) read from.
-
-    Returns the number of tiles saved.
-    """
-    saved = 0
-    for tile, vertices, triangles in generate_intermediate_tiles(
-        dataset_path,
-        tiles,
-        intermediate_dir,
-        tile_size=tile_size,
-        max_workers=max_workers,
-    ):
-        _save_intermediate_tile(tile, vertices, triangles, tile_size, intermediate_dir)
-        saved += 1
-    return saved
 
 
 # A tile flowing through the pipeline, or the sentinel marking "no more tiles".
@@ -915,14 +526,13 @@ def generate_terrain_tiles_streaming(
     submissions -- the whole pipeline throttles to the speed of its slowest
     stage instead of one phase racing ahead and piling results up in memory.
 
-    Compared to generate_and_save_intermediate_tiles -> apply_vertex_averaging
-    -> encode_terrain_tiles, this:
+    Compared to running the three phases as three full-corpus batches, this:
       - never barriers on "every tile in the zoom level" between phases --
         a tile's .terrain file can be written while a tile two rows over is
         still mid-triangulation.
-      - never round-trips vertices through disk for stitching (the batch
-        Phase 2 loads two .npz files, averages, writes two .npz files, per
-        edge; this does it in memory, once per edge, ever).
+      - never round-trips vertices through disk for stitching (a batched
+        Phase 2 would load two .npz files, average, and write two .npz files
+        back per edge; this does it in memory, once per edge, ever).
       - replaces the four even/odd corner-avoidance passes with a single
         O(n) rendezvous join (see RendezvousStitcher).
 
@@ -976,9 +586,8 @@ def generate_terrain_tiles_streaming(
 
     def encode_stage() -> None:
         """Consumer: fan boundary-complete tiles out across a thread pool
-        (encoding releases the GIL enough that threads pull their weight here
-        -- same choice the batch Phase 3 already makes) and write each
-        .terrain file as soon as it's ready."""
+        (encoding releases the GIL enough that threads pull their weight
+        here) and write each .terrain file as soon as it's ready."""
         nonlocal written_count
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = []
@@ -1238,218 +847,6 @@ def generate_terrain_tiles_from_array(
     finally:
         shm.close()
         shm.unlink()
-
-
-def _process_edge_batch(
-    edges: list[tuple[IntermediateTileMetadata, IntermediateTileMetadata]],
-) -> int:
-    """Process a batch of edges (average vertices and update files).
-
-    Returns the number of edges processed.
-    """
-    processed = 0
-    for meta1, meta2 in edges:
-        try:
-            # Average vertices
-            vertices1, vertices2 = _average_edge_vertices(meta1, meta2)
-
-            # Update both tiles on disk
-            _update_intermediate_tile_vertices(meta1, vertices1)
-            _update_intermediate_tile_vertices(meta2, vertices2)
-
-            processed += 1
-        except Exception as e:
-            logger.error(
-                f"  Error processing edge {meta1.tile_key} - {meta2.tile_key}: {e}"
-            )
-
-    return processed
-
-
-def apply_vertex_averaging(
-    intermediate_dir: Path,
-    zoom_levels: list[int] | None = None,
-    max_workers: int | None = None,
-    progress_callback: Callable[[str, int, int], None] | None = None,
-) -> None:
-    """Phase 2: Apply vertex averaging to intermediate tiles.
-
-    Processes tile boundaries in 4 passes (horizontal_even, horizontal_odd,
-    vertical_even, vertical_odd) to avoid corner conflicts. Each pass can be
-    parallelized.
-
-    Args:
-        intermediate_dir: Directory containing intermediate .npz files
-        zoom_levels: Optional list of zoom levels to process (default: all)
-        max_workers: Maximum number of parallel workers (default: CPU count)
-        progress_callback: Optional callback function(pass_name, completed, total)
-    """
-    logger.info("Phase 2: Applying vertex averaging...")
-    logger.info(f"  Intermediate directory: {intermediate_dir}")
-
-    # Load metadata index
-    logger.info("  Loading intermediate tile metadata...")
-    metadata_index = _load_metadata_from_intermediate_dir(intermediate_dir)
-    logger.info(f"  Found {len(metadata_index)} intermediate tiles")
-
-    # Determine zoom levels to process
-    if zoom_levels is None:
-        zoom_levels = sorted(set(meta.zoom for meta in metadata_index.values()))
-
-    logger.info(f"  Processing {len(zoom_levels)} zoom levels: {zoom_levels}")
-
-    # Process each zoom level
-    for zoom in zoom_levels:
-        logger.info(f"\n  Zoom level {zoom}:")
-
-        # Process in 4 passes to avoid corner conflicts
-        edge_types = [
-            "horizontal_even",
-            "horizontal_odd",
-            "vertical_even",
-            "vertical_odd",
-        ]
-
-        for edge_type in edge_types:
-            logger.info(f"    Pass: {edge_type}")
-
-            # Find all edges of this type
-            edges = _find_edges_by_type(metadata_index, zoom, edge_type)
-            logger.info(f"      Found {len(edges)} edges to process")
-
-            if len(edges) == 0:
-                continue
-
-            completed = 0
-            total = len(edges)
-
-            if len(edges) > 1:
-                # Process edges in parallel
-                # Split into smaller batches to get better progress updates
-                batch_size = max(1, len(edges) // (max_workers or 4))
-                batches = [
-                    edges[i: i + batch_size] for i in range(0, len(edges), batch_size)
-                ]
-
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(_process_edge_batch, batch): batch
-                        for batch in batches
-                    }
-
-                    for future in as_completed(futures):
-                        try:
-                            batch_processed = future.result()
-                            completed += batch_processed
-
-                            if progress_callback:
-                                progress_callback(edge_type, completed, total)
-
-                            logger.info(
-                                f"      Progress: {completed}/{total} edges processed"
-                            )
-                        except Exception as e:
-                            logger.info(f"      Error processing batch: {e}")
-            else:
-                # Single edge - process directly
-                completed = _process_edge_batch(edges)
-                if progress_callback:
-                    progress_callback(edge_type, completed, total)
-                logger.info(f"      Progress: {completed}/{total} edges processed")
-
-            logger.info(f"      Pass complete: {completed} edges averaged")
-
-    logger.info("\nPhase 2 complete: Vertex averaging applied")
-
-
-def _encode_single_terrain_tile(
-    metadata: IntermediateTileMetadata,
-    output_dir: Path,
-    cleanup: bool,
-) -> None:
-    """Encode and write a single terrain tile from intermediate representation."""
-    # Load intermediate tile
-    vertices, triangles, _ = _load_intermediate_tile(metadata)
-
-    # Create Tile object for _write_tile
-    tile = Tile(
-        zoom=metadata.zoom,
-        tile_x=metadata.tile_x,
-        tile_y=metadata.tile_y,
-        boundingbox=metadata.boundingbox,
-    )
-
-    # Write terrain tile (rescale=True to convert from pixel to geo coordinates)
-    _write_tile(tile, vertices, triangles, output_dir, rescale=True)
-
-    # Cleanup intermediate file if requested
-    if cleanup:
-        metadata.file_path.unlink(missing_ok=True)
-
-
-def encode_terrain_tiles(
-    intermediate_dir: Path,
-    output_dir: Path,
-    max_workers: int | None = None,
-    cleanup: bool = True,
-    progress_callback: Callable[[int, int], None] | None = None,
-) -> None:
-    """Phase 3: Convert intermediate tiles to terrain tiles.
-
-    Reads intermediate .npz files, encodes them as quantized mesh terrain tiles,
-    and writes to output directory. Optionally cleans up intermediate files.
-
-    Args:
-        intermediate_dir: Directory containing intermediate .npz files
-        output_dir: Output directory for terrain tiles
-        max_workers: Maximum number of parallel workers (default: CPU count)
-        cleanup: Whether to delete intermediate files after encoding (default True)
-        progress_callback: Optional callback function(completed, total)
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Phase 3: Encoding terrain tiles...")
-    logger.info(f"  Input directory: {intermediate_dir}")
-    logger.info(f"  Output directory: {output_dir}")
-    logger.info(f"  Cleanup intermediate files: {cleanup}")
-
-    # Load metadata index
-    logger.info("  Loading intermediate tile metadata...")
-    metadata_index = _load_metadata_from_intermediate_dir(intermediate_dir)
-    tiles_to_encode = list(metadata_index.values())
-    logger.info(f"  Found {len(tiles_to_encode)} tiles to encode")
-
-    completed = 0
-    total = len(tiles_to_encode)
-
-    # Parallel processing with threads (I/O bound)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _encode_single_terrain_tile,
-                metadata,
-                output_dir,
-                cleanup,
-            ): metadata
-            for metadata in tiles_to_encode
-        }
-
-        for future in as_completed(futures):
-            try:
-                future.result()
-                completed += 1
-
-                if progress_callback:
-                    progress_callback(completed, total)
-
-                if completed % 100 == 0 or completed == total:
-                    logger.info(f"  Progress: {completed}/{total} tiles encoded")
-
-            except Exception as e:
-                metadata = futures[future]
-                logger.error(f"  Error encoding tile {metadata.tile_key}: {e}")
-
-    logger.info(f"Phase 3 complete: {completed} terrain tiles generated")
 
 
 def encode_terrain_tiles_streaming(

@@ -14,9 +14,6 @@ from osgeo import gdal
 from qmesh.cesium import render_layerjson
 from qmesh.memory_raster import reproject_sources_to_memory
 from qmesh.mesh import (
-    apply_vertex_averaging,
-    encode_terrain_tiles,
-    generate_and_save_intermediate_tiles,
     generate_terrain_dummy,
     generate_terrain_tiles_from_array,
     generate_terrain_tiles_streaming,
@@ -94,23 +91,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Generate tiles and exit, without starting the local HTTP server",
     )
     parser.add_argument(
-        "--legacy-batch",
+        "--on-disk",
         action="store_true",
         help=(
-            "Use the older three-barrier pipeline (triangulate all tiles, "
-            "then stitch all tiles, then encode all tiles) instead of the "
-            "default streaming one-tile-at-a-time pipeline."
-        ),
-    )
-    parser.add_argument(
-        "--in-memory",
-        action="store_true",
-        help=(
-            "Reproject/mosaic straight into a single in-memory array (no "
-            "intermediate files at all -- not even a VRT) and compute the "
-            "pyramid from that array's own bounds as a post step, instead "
-            "of from a file on disk. Implies the streaming pipeline; not "
-            "compatible with --legacy-batch."
+            "Reproject/mosaic through intermediate files (one reprojected "
+            "raster per source plus a VRT mosaic) and compute the pyramid "
+            "from that mosaic on disk, instead of the default single "
+            "in-memory array."
         ),
     )
     return parser.parse_args(argv)
@@ -121,9 +108,6 @@ def main(argv: list[str] | None = None) -> None:
     gdal.UseExceptions()
     args = parse_args(argv)
 
-    if args.legacy_batch and args.in_memory:
-        raise ValueError("--legacy-batch and --in-memory can't be used together")
-
     download_dir = args.download_dir or Path("assets/tmp")
     source_images = resolve_source_images(args.inputs or ["assets/tmp"], download_dir)
 
@@ -133,17 +117,7 @@ def main(argv: list[str] | None = None) -> None:
     logger.info(f"Found {len(source_images)} source images to reproject")
 
     in_memory_raster = None
-    if args.in_memory:
-        # Everything up to here (and this reproject/mosaic step) has stayed
-        # in memory -- no intermediate files, not even a VRT. dataset_bbox
-        # below comes straight out of the array's own transform: the
-        # pyramid is computed *after* the data exists, from the data
-        # itself, not from a file this step had to write first.
-        in_memory_raster = reproject_sources_to_memory(
-            source_images, args.source_srs, args.target_srs
-        )
-        dataset_bbox = in_memory_raster.bounds
-    else:
+    if args.on_disk:
         # Reproject all images to the target CRS
         intermediate_dir = args.output / "intermediate"
         intermediate_dir.mkdir(parents=True, exist_ok=True)
@@ -171,6 +145,16 @@ def main(argv: list[str] | None = None) -> None:
 
         logger.info(f"Created VRT mosaic: {image_transformed}")
         dataset_bbox = image_get_boundingbox(image_transformed)
+    else:
+        # Default: everything up to here (and this reproject/mosaic step)
+        # stays in memory -- no intermediate files, not even a VRT.
+        # dataset_bbox below comes straight out of the array's own
+        # transform: the pyramid is computed *after* the data exists, from
+        # the data itself, not from a file this step had to write first.
+        in_memory_raster = reproject_sources_to_memory(
+            source_images, args.source_srs, args.target_srs
+        )
+        dataset_bbox = in_memory_raster.bounds
 
     logger.info(
         f"Dataset bounds: {dataset_bbox.minx} {dataset_bbox.miny} "
@@ -203,29 +187,12 @@ def main(argv: list[str] | None = None) -> None:
     max_workers = os.cpu_count()  # Use all available CPU cores
     logger.info(f"  Workers: {max_workers}")
 
-    if args.legacy_batch:
-        # Three full barriers: triangulate everything, stitch everything,
-        # encode everything -- kept around as a known-good fallback.
-        intermediate_tiles_dir = args.output / "intermediate_tiles"
-        logger.info(f"  Intermediate directory: {intermediate_tiles_dir}")
-
-        logger.info(f"\n{'=' * 70}")
-        saved = generate_and_save_intermediate_tiles(
-            image_transformed, real_tiles, intermediate_tiles_dir, max_workers=max_workers
-        )
-        logger.info(f"Phase 1 complete: {saved} tiles saved to {intermediate_tiles_dir}")
-
-        logger.info(f"\n{'=' * 70}")
-        apply_vertex_averaging(intermediate_tiles_dir, max_workers=max_workers)
-
-        logger.info(f"\n{'=' * 70}")
-        encode_terrain_tiles(
-            intermediate_tiles_dir, tiles_output_dir, max_workers=max_workers, cleanup=True
-        )
-    elif in_memory_raster is not None:
-        # Same pipeline as the streaming default, but triangulation reads
-        # its windows out of shared memory instead of opening a file.
-        logger.info(f"\n{'=' * 70}")
+    # Either way: triangulate -> stitch -> encode as one pipeline, tile by
+    # tile, connected by producer/consumer queues (see mesh.py for why).
+    logger.info(f"\n{'=' * 70}")
+    if in_memory_raster is not None:
+        # Triangulation reads its windows out of shared memory instead of
+        # opening a file.
         generate_terrain_tiles_from_array(
             in_memory_raster,
             real_tiles,
@@ -233,9 +200,6 @@ def main(argv: list[str] | None = None) -> None:
             max_workers=max_workers,
         )
     else:
-        # Default: triangulate -> stitch -> encode as one pipeline, tile by
-        # tile, connected by producer/consumer queues (see mesh.py for why).
-        logger.info(f"\n{'=' * 70}")
         generate_terrain_tiles_streaming(
             image_transformed,
             real_tiles,
